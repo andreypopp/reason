@@ -1499,6 +1499,8 @@ structure_item:
     ( item_extension_sugar structure_item_without_item_extension_sugar
       { struct_item_extension $1 $2 }
       /* Each let binding has its own attribute* */
+    | let_do_bindings
+      { val_of_let_bindings $1 }
     | let_bindings
       { val_of_let_bindings $1 }
     ) { [$1] }
@@ -2273,6 +2275,12 @@ mark_position_exp
   | semi_terminated_seq_expr_row
     { $1 }
   /* Let bindings already have their potential item_extension_sugar. */
+  | let_do_bindings SEMI semi_terminated_seq_expr
+    { expr_of_let_bindings $1 $3 }
+  | let_do_bindings SEMI?
+    { let loc = mklocation $symbolstartpos $endpos in
+      expr_of_let_bindings $1 @@ ghunit ~loc ()
+    }
   | let_bindings SEMI semi_terminated_seq_expr
     { expr_of_let_bindings $1 $3 }
   | let_bindings SEMI?
@@ -2940,11 +2948,33 @@ labeled_expr:
   { mklb $3 $1 (mklocation $symbolstartpos $endpos) }
 ;
 
+%inline and_let_do_binding:
+  item_attributes AND let_do_binding_body
+  { mklb $3 $1 (mklocation $symbolstartpos $endpos) }
+;
+
 let_bindings: let_binding and_let_binding* { addlbs $1 $2 };
+
+let_do_bindings: let_do_binding and_let_do_binding* { addlbs $1 $2 };
+
+let_do_binding:
+  | LET rec_flag let_do_binding_body
+  { let ext_id = Some (mkloc "bind_open" (dummy_loc ())) in
+    let loc = mklocation $symbolstartpos $endpos in
+    mklbs ([], ext_id) $2 (mklb $3 [] loc) loc
+  }
+  | DO expr
+  { let ghost_loc = dummy_loc () in
+    let ext_id = Some (mkloc "bind_open" ghost_loc) in
+    let pat = mkpat (Ppat_construct (mkloc (Lident "()") ghost_loc, None)) in
+    let loc = mklocation $symbolstartpos $endpos in
+    mklbs ([], ext_id) Nonrecursive (mklb (pat, $2) [] loc) loc
+  }
+;
 
 let_binding:
   /* Form with item extension sugar */
-  ioption(item_extension_sugar) item_attributes LET rec_flag let_binding_body
+  | ioption(item_extension_sugar) item_attributes LET rec_flag let_binding_body
   { let (ext_attrs, ext_id) = match $1 with
       | Some (ext_attrs, ext_id) -> (ext_attrs, Some ext_id)
       | None -> ([], None)
@@ -2952,6 +2982,30 @@ let_binding:
     let loc = mklocation $symbolstartpos $endpos in
     mklbs (ext_attrs, ext_id) $4 (mklb $5 $2 loc) loc
   }
+;
+
+let_do_binding_body:
+  | with_patvar(val_ident) type_constraint EQUAL DO expr
+    { let loc = mklocation $symbolstartpos $endpos in
+      ($1, ghexp_constraint loc $5 $2) }
+  | with_patvar(val_ident) COLON preceded(QUOTE,ident)+ DOT only_core_type(core_type)
+      EQUAL DO mark_position_exp(expr)
+    { let typ = mktyp ~ghost:true (Ptyp_poly($3, $5)) in
+      let loc = mklocation $symbolstartpos $endpos in
+      (mkpat ~ghost:true ~loc (Ppat_constraint($1, typ)), $8)
+    }
+  | with_patvar(val_ident) COLON TYPE LIDENT+ DOT only_core_type(core_type)
+      DO EQUAL mark_position_exp(expr)
+   { let exp, poly = wrap_type_annotation $4 $6 $9 in
+     let loc = mklocation $symbolstartpos $endpos in
+     (mkpat ~ghost:true ~loc (Ppat_constraint($1, poly)), exp)
+   }
+  | pattern EQUAL DO expr
+    { ($1, $4) }
+  | simple_pattern_not_ident COLON only_core_type(core_type) EQUAL DO expr
+    { let loc = mklocation $symbolstartpos $endpos in
+      (mkpat ~loc (Ppat_constraint($1, $3)), $6)
+    }
 ;
 
 let_binding_body:

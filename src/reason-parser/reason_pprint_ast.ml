@@ -60,6 +60,11 @@ open Easy_format
 open Syntax_util
 open Ast_mapper
 
+open Migrate_parsetree
+module To_current = Convert(OCaml_404)(OCaml_current)
+
+let print_expression e =
+  Pprintast.expression Format.std_formatter (To_current.copy_expression e)
 
 type commentCategory =
   | EndOfLine
@@ -2420,6 +2425,10 @@ let is_unit_pattern x = match x.ppat_desc with
   | Ppat_construct ( {txt= Lident"()"}, None) -> true
   | _ -> false
 
+let is_unit_expression x = match x.pexp_desc with
+  | Pexp_construct ( {txt= Lident"()"}, None) -> true
+  | _ -> false
+
 let is_direct_pattern x = x.ppat_attributes = [] && match x.ppat_desc with
   | Ppat_construct ( {txt= Lident"()"}, None) -> true
   | _ -> false
@@ -2569,6 +2578,9 @@ let formatComputedInfixChain infixChainList =
   in
   print [] [] "" infixChainList
 
+type monadic_syntax = 
+  | MonadicLet of expression
+  | MonadicDo of expression * expression
 
 class printer  ()= object(self:'self)
   val pipe = false
@@ -4134,14 +4146,18 @@ class printer  ()= object(self:'self)
       );
   *)
 
-  method formatSimplePatternBinding labelOpener layoutPattern typeConstraint appTerms =
+  method formatSimplePatternBinding ?(is_monadic=false) labelOpener layoutPattern typeConstraint appTerms =
     let letPattern = label ~break:`Never ~space:true (atom labelOpener) layoutPattern in
     let upUntilEqual =
       match typeConstraint with
         | None -> letPattern
         | Some tc -> formatTypeConstraint letPattern tc
     in
-    let includingEqual = makeList ~postSpace:true [upUntilEqual; atom "="] in
+    let includingEqual =
+      makeList
+        ~postSpace:true
+        (if is_monadic then [upUntilEqual; atom "="; atom "do"] else [upUntilEqual; atom "="])
+    in
     formatAttachmentApplication applicationFinalWrapping (Some (true, includingEqual)) appTerms
 
   (* Only formats a type annotation for a value binding. *)
@@ -4410,7 +4426,7 @@ class printer  ()= object(self:'self)
      parser.
   *)
 
-  method locallyAbstractPolymorphicFunctionBinding prefixText layoutPattern funWithNewTypes absVars bodyType =
+  method locallyAbstractPolymorphicFunctionBinding ?(is_monadic=false) prefixText layoutPattern funWithNewTypes absVars bodyType =
     let appTerms = self#unparseExprApplicationItems funWithNewTypes in
     let locallyAbstractTypes = (List.map atom absVars) in
     let typeLayout =
@@ -4424,6 +4440,7 @@ class printer  ()= object(self:'self)
         typeLayout
       in
     self#formatSimplePatternBinding
+      ~is_monadic
       prefixText
       layoutPattern
       (Some polyType)
@@ -4446,7 +4463,7 @@ class printer  ()= object(self:'self)
            ...
          }
    *)
-  method wrappedBinding prefixText ~arrow pattern patternAux expr =
+  method wrappedBinding ?(is_monadic=false) prefixText ~arrow pattern patternAux expr =
     let (_sweet, argsList, return) = self#curriedPatternsAndReturnVal expr in
     let patternList = match patternAux with
       | [] -> pattern
@@ -4456,11 +4473,11 @@ class printer  ()= object(self:'self)
       | ([], Pexp_constraint (e, ct)) ->
           let typeLayout = SourceMap (ct.ptyp_loc, (self#core_type ct)) in
           let appTerms = self#unparseExprApplicationItems e in
-          self#formatSimplePatternBinding prefixText patternList (Some typeLayout) appTerms
+          self#formatSimplePatternBinding ~is_monadic prefixText patternList (Some typeLayout) appTerms
       | ([], _) ->
           (* simple let binding, e.g. `let number = 5` *)
           let appTerms = self#unparseExprApplicationItems expr  in
-          self#formatSimplePatternBinding prefixText patternList None appTerms
+          self#formatSimplePatternBinding ~is_monadic prefixText patternList None appTerms
       | (_::_, _) ->
           let (argsWithConstraint, actualReturn) = self#normalizeFunctionArgsConstraint argsList return in
           let fauxArgs =
@@ -4495,10 +4512,10 @@ class printer  ()= object(self:'self)
           self#wrapCurriedFunctionBinding prefixText ~arrow:"=" pattern fauxArgs
             (self#classExpressionToFormattedApplicationItems actualReturn, None)
 
-  method binding prefixText x = (* TODO: print attributes *)
+  method binding ?(is_monadic=false) prefixText x = (* TODO: print attributes *)
     let body = match x.pvb_pat.ppat_desc with
       | (Ppat_var {txt}) ->
-        self#wrappedBinding prefixText ~arrow:"=>"
+        self#wrappedBinding ~is_monadic prefixText ~arrow:"=>"
           (SourceMap (x.pvb_pat.ppat_loc, self#simple_pattern x.pvb_pat))
           [] x.pvb_expr
       (*
@@ -4583,6 +4600,7 @@ class printer  ()= object(self:'self)
                  corresponds to a leading prefix of the Pexp_newtype variables.
               *)
               self#locallyAbstractPolymorphicFunctionBinding
+                ~is_monadic
                 prefixText
                 layoutPattern
                 funWithNewTypes
@@ -4592,6 +4610,7 @@ class printer  ()= object(self:'self)
               let typeLayout = SourceMap (ty.ptyp_loc, (self#core_type ty)) in
               let appTerms = self#unparseExprApplicationItems x.pvb_expr in
               self#formatSimplePatternBinding
+                ~is_monadic
                 prefixText
                 layoutPattern
                 (Some typeLayout)
@@ -4601,7 +4620,7 @@ class printer  ()= object(self:'self)
           let layoutPattern =
             SourceMap (x.pvb_pat.ppat_loc, self#pattern x.pvb_pat) in
           let appTerms = self#unparseExprApplicationItems x.pvb_expr in
-          self#formatSimplePatternBinding prefixText layoutPattern None appTerms
+          self#formatSimplePatternBinding ~is_monadic prefixText layoutPattern None appTerms
     in
     self#attach_std_item_attrs x.pvb_attributes (SourceMap (x.pvb_loc, body))
 
@@ -4633,7 +4652,7 @@ class printer  ()= object(self:'self)
       loc_ghost = false
     }
 
-  method bindings (rf, l) =
+  method bindings ?(is_monadic=false) (rf, l) =
     let first, rest = match l with
       | [] -> raise (NotPossible "no bindings supplied")
       | x :: xs -> x, xs
@@ -4642,7 +4661,7 @@ class printer  ()= object(self:'self)
       | Nonrecursive -> "let"
       | Recursive -> "let rec"
     in
-    let first = self#binding label first in
+    let first = self#binding ~is_monadic label first in
     match rest with
     | [] -> first
     | _ ->
@@ -4651,16 +4670,83 @@ class printer  ()= object(self:'self)
         ~break:Always
         ~indent:0
         ~inline:(true, true)
-        (first :: List.map (self#binding "and") rest)
+        (first :: List.map (self#binding ~is_monadic "and") rest)
 
-  method letList exprTerm =
+  (* Try to find if expression is a monadic expression for which we provide
+   * sugared syntax.
+   *
+   * Two cases here:
+   *
+   * 1. `let%bind_open N = E` -> `letm N = E`
+   * 2. `let%bind_open () = E` -> `do E`
+   *
+   *)
+  method sugarMonadicSyntax = 
+
+    (* Futher discover if `let%bind_open () = E` can be sugared into `do E` *)
+    let sugarMonadicDo expr = match expr.pexp_desc with
+      | Pexp_let (
+        Nonrecursive,
+        [{
+          pvb_pat = {
+            ppat_desc = Ppat_construct ({ txt = Lident "()"; loc = _; }, None);
+            ppat_loc = _;
+            ppat_attributes = [];
+          };
+          pvb_expr = what;
+          pvb_attributes = [];
+          pvb_loc = _
+        }],
+        expr) ->
+        Some (MonadicDo (what, expr))
+      | _ ->
+        None
+    in
+
+    function
+    | Pexp_extension (
+        { txt = "bind_open"; loc = _ },
+        PStr [{
+          pstr_desc = Pstr_eval ({
+            pexp_desc = Pexp_let (f, b, e);
+            pexp_loc = _;
+            pexp_attributes = [];
+          } as lb, []);
+          pstr_loc = _
+        }]
+      ) -> (
+        match sugarMonadicDo lb with
+        | Some syn -> Some syn
+        | None -> Some (MonadicLet lb)
+      )
+    | _ ->
+      None
+
+  method maybeUnparseMonadicExpr exprTerm =
+    match self#sugarMonadicSyntax exprTerm.pexp_desc with
+    | Some (MonadicLet e) ->
+      Some (self#letList ~is_monadic:true e)
+    | Some (MonadicDo (what, e)) ->
+      let what = self#unparseExpr what in
+      let what = label ~break:`Never ~space:true (atom "do") what in
+      if is_unit_expression e then
+        Some [what]
+      else
+        Some (what::(self#letList ~is_monadic:true e))
+    | None -> 
+      None
+
+  method letList ?(is_monadic=false) exprTerm =
+    match self#maybeUnparseMonadicExpr exprTerm with
+    | Some layoutNode -> layoutNode
+    | None -> (
     match (exprTerm.pexp_attributes, exprTerm.pexp_desc) with
       | ([], Pexp_let (rf, l, e)) ->
         (* For "letList" bindings, the start/end isn't as simple as with
          * module value bindings. For "let lists", the sequences were formed
          * within braces {}. The parser relocates the first let binding to the
          * first brace. *)
-         let bindingsLayout = (self#bindings (rf, l)) in
+         let bindingsLayout = (self#bindings ~is_monadic (rf, l)) in
          let bindingsLoc = self#bindingsLocationRange l in
          let bindingsSourceMapped = SourceMap (bindingsLoc, bindingsLayout) in
          bindingsSourceMapped::(self#letList e)
@@ -4707,15 +4793,16 @@ class printer  ()= object(self:'self)
            * deeply inspecting the leftmost token/term in the expression. *)
           let e1SourceMapped = SourceMap (e1.pexp_loc, e1Layout) in
           e1SourceMapped::(self#letList e2)
-      | _ ->
-          let exprTermLayout = (self#unparseExpr exprTerm) in
-          let exprTermSourceMapped = SourceMap (exprTerm.pexp_loc, exprTermLayout) in
-          (* Should really do something to prevent infinite loops here. Never
-             allowing a top level call into letList to recurse back to
-             self#unparseExpr- top level calls into letList *must* be one of the
-             special forms above whereas lower level recursive calls may be of
-             any form. *)
-          [exprTermSourceMapped]
+      | (_, n) ->
+        let exprTermLayout = (self#unparseExpr exprTerm) in
+        let exprTermSourceMapped = SourceMap (exprTerm.pexp_loc, exprTermLayout) in
+        (* Should really do something to prevent infinite loops here. Never
+          allowing a top level call into letList to recurse back to
+          self#unparseExpr- top level calls into letList *must* be one of the
+          special forms above whereas lower level recursive calls may be of
+          any form. *)
+        [exprTermSourceMapped]
+      )
 
   method constructor_expression ?(polyVariant=false) ~arityIsClear stdAttrs ctor eo =
     let (implicit_arity, arguments) =
@@ -5303,7 +5390,10 @@ class printer  ()= object(self:'self)
     if stdAttrs <> [] then
       None
     else
-      let item = match x.pexp_desc with
+      let item = match self#maybeUnparseMonadicExpr x with
+      | Some layoutNode -> Some (makeLetSequence layoutNode)
+      | None -> (
+      match x.pexp_desc with
         (* The only reason Pexp_fun must also be wrapped in parens is that its =>
            token will be confused with the match token. *)
         | Pexp_fun _ when pipe || semi -> Some (self#reset#simplifyUnparseExpr x)
@@ -5440,9 +5530,11 @@ class printer  ()= object(self:'self)
           let lhs = self#simple_enough_to_be_lhs_dot_send e in
           let lhs = if needparens then makeList ~wrap:("(",")") [lhs] else lhs in
           Some (label (makeList [lhs; atom "#";]) (atom s))
-        | Pexp_extension e -> Some (self#extension e)
+        | Pexp_extension e -> 
+          Some (self#extension e)
         | _ -> None
-      in
+      ) in
+
       match item with
         | None -> None
         | Some i -> Some (SourceMap (x.pexp_loc, i))
